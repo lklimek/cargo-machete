@@ -7,7 +7,7 @@ inputs:
     required: false
     default: "."
 branding:
-  color: "black"
+  color: "gray-dark"
   icon: "code"
 runs:
   using: composite
