@@ -1,6 +1,11 @@
-name: 'cargo-machete'
-description: 'A github action for cargo machete'
-author: 'Cargo machete community'
+name: "cargo-machete"
+description: "A github action for cargo machete"
+author: "Cargo machete community"
+inputs:
+  cargo_manifest_dir:
+    description: "The directory of the Cargo.toml file"
+    required: false
+    default: "."
 branding:
   color: "black"
   icon: "code"
@@ -16,3 +21,4 @@ runs:
       uses: actions-rs/cargo@v1
       with:
         command: machete
+        args: ${{ inputs.cargo_manifest_dir }}
