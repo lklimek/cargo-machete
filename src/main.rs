@@ -5,8 +5,7 @@ use anyhow::Context;
 use rayon::prelude::*;
 use std::path::Path;
 use std::str::FromStr;
-use std::{fs, path::PathBuf};
-use walkdir::WalkDir;
+use std::{borrow::Cow, fs, path::PathBuf};
 
 #[derive(Clone, Copy)]
 pub(crate) enum UseCargoMetadata {
@@ -18,22 +17,6 @@ pub(crate) enum UseCargoMetadata {
 impl UseCargoMetadata {
     fn all() -> &'static [UseCargoMetadata] {
         &[UseCargoMetadata::Yes, UseCargoMetadata::No]
-    }
-}
-
-impl From<UseCargoMetadata> for bool {
-    fn from(v: UseCargoMetadata) -> bool {
-        matches!(v, UseCargoMetadata::Yes)
-    }
-}
-
-impl From<bool> for UseCargoMetadata {
-    fn from(b: bool) -> Self {
-        if b {
-            Self::Yes
-        } else {
-            Self::No
-        }
     }
 }
 
@@ -62,6 +45,10 @@ struct MacheteArgs {
     #[argh(switch)]
     fix: bool,
 
+    /// also search in ignored files (.gitignore, .ignore, etc.) when searching for files.
+    #[argh(switch)]
+    no_ignore: bool,
+
     /// print version.
     #[argh(switch)]
     version: bool,
@@ -71,25 +58,31 @@ struct MacheteArgs {
     paths: Vec<PathBuf>,
 }
 
-fn collect_paths(path: &Path, skip_target_dir: bool) -> Result<Vec<PathBuf>, walkdir::Error> {
-    // Find directory entries.
-    let walker = WalkDir::new(path).into_iter();
+struct CollectPathOptions {
+    skip_target_dir: bool,
+    respect_ignore_files: bool,
+}
 
-    let manifest_path_entries = if skip_target_dir {
-        walker
-            .filter_entry(|entry| !entry.path().ends_with("target"))
-            .collect()
-    } else {
-        walker.collect::<Vec<_>>()
-    };
+fn collect_paths(path: &Path, options: CollectPathOptions) -> Result<Vec<PathBuf>, ignore::Error> {
+    // Find directory entries.
+    let mut builder = ignore::WalkBuilder::new(path);
+
+    builder.standard_filters(options.respect_ignore_files);
+
+    if options.skip_target_dir {
+        builder.filter_entry(|entry| !entry.path().ends_with("target"));
+    }
+
+    let walker = builder.build();
 
     // Keep only errors and `Cargo.toml` files (filter), then map correct paths into owned
     // `PathBuf`.
-    manifest_path_entries
+    walker
         .into_iter()
-        .filter(|entry| match entry {
-            Ok(entry) => entry.file_name() == "Cargo.toml",
-            Err(_) => true,
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map_or(true, |entry| entry.file_name() == "Cargo.toml")
         })
         .map(|res_entry| res_entry.map(|e| e.into_path()))
         .collect()
@@ -125,13 +118,12 @@ fn run_machete() -> anyhow::Result<bool> {
 
     if args.paths.is_empty() {
         eprintln!("Analyzing dependencies of crates in this directory...");
-        args.paths.push(std::env::current_dir()?);
+        args.paths.push(PathBuf::from("."));
     } else {
         eprintln!(
             "Analyzing dependencies of crates in {}...",
             args.paths
                 .iter()
-                .cloned()
                 .map(|path| path.as_os_str().to_string_lossy().to_string())
                 .collect::<Vec<_>>()
                 .join(",")
@@ -142,7 +134,13 @@ fn run_machete() -> anyhow::Result<bool> {
     let mut walkdir_errors = Vec::new();
 
     for path in args.paths {
-        let manifest_path_entries = match collect_paths(&path, args.skip_target_dir) {
+        let manifest_path_entries = match collect_paths(
+            &path,
+            CollectPathOptions {
+                skip_target_dir: args.skip_target_dir,
+                respect_ignore_files: !args.no_ignore,
+            },
+        ) {
             Ok(entries) => entries,
             Err(err) => {
                 walkdir_errors.push(err);
@@ -150,12 +148,18 @@ fn run_machete() -> anyhow::Result<bool> {
             }
         };
 
+        let with_metadata = if args.with_metadata {
+            UseCargoMetadata::Yes
+        } else {
+            UseCargoMetadata::No
+        };
+
         // Run analysis in parallel. This will spawn new rayon tasks when dependencies are effectively
         // used by any Rust crate.
         let results = manifest_path_entries
             .par_iter()
-            .filter_map(|manifest_path| {
-                match find_unused(manifest_path, args.with_metadata.into()) {
+            .filter_map(
+                |manifest_path| match find_unused(manifest_path, with_metadata) {
                     Ok(Some(analysis)) => {
                         if analysis.unused.is_empty() {
                             None
@@ -176,23 +180,22 @@ fn run_machete() -> anyhow::Result<bool> {
                         eprintln!("error when handling {}: {}", manifest_path.display(), err);
                         None
                     }
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>();
 
         // Display all the results.
+        let location = match path.to_string_lossy() {
+            Cow::Borrowed(".") => Cow::from("this directory"),
+            pathstr => pathstr,
+        };
+
         if results.is_empty() {
-            println!(
-                "cargo-machete didn't find any unused dependencies in {}. Good job!",
-                path.to_string_lossy()
-            );
+            println!("cargo-machete didn't find any unused dependencies in {location}. Good job!");
             continue;
         }
 
-        println!(
-            "cargo-machete found the following unused dependencies in {}:",
-            path.to_string_lossy()
-        );
+        println!("cargo-machete found the following unused dependencies in {location}:");
         for (analysis, path) in results {
             println!("{} -- {}:", analysis.package_name, path.to_string_lossy());
             for dep in &analysis.unused {
@@ -231,7 +234,7 @@ fn run_machete() -> anyhow::Result<bool> {
             );
         }
 
-        println!()
+        println!();
     }
 
     eprintln!("Done!");
@@ -251,7 +254,7 @@ fn run_machete() -> anyhow::Result<bool> {
 }
 
 fn remove_dependencies(manifest: &str, dependencies_list: &[String]) -> anyhow::Result<String> {
-    let mut manifest = toml_edit::Document::from_str(manifest)?;
+    let mut manifest = toml_edit::DocumentMut::from_str(manifest)?;
     let dependencies = manifest
         .iter_mut()
         .find_map(|(k, v)| (v.is_table_like() && k == "dependencies").then_some(Some(v)))
@@ -290,13 +293,28 @@ const TOP_LEVEL: &str = concat!(env!("CARGO_MANIFEST_DIR"));
 fn test_ignore_target() {
     let entries = collect_paths(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/with-target/"),
-        true,
+        CollectPathOptions {
+            skip_target_dir: true,
+            respect_ignore_files: false,
+        },
     );
     assert!(entries.unwrap().is_empty());
 
     let entries = collect_paths(
         &PathBuf::from(TOP_LEVEL).join("./integration-tests/with-target/"),
-        false,
+        CollectPathOptions {
+            skip_target_dir: false,
+            respect_ignore_files: true,
+        },
+    );
+    assert!(entries.unwrap().is_empty());
+
+    let entries = collect_paths(
+        &PathBuf::from(TOP_LEVEL).join("./integration-tests/with-target/"),
+        CollectPathOptions {
+            skip_target_dir: false,
+            respect_ignore_files: false,
+        },
     );
     assert!(!entries.unwrap().is_empty());
 }
